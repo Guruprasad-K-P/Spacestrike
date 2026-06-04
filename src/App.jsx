@@ -304,20 +304,23 @@ export default function App() {
         if (s.bullets[i].y < -20) s.bullets.splice(i, 1);
       }
 
-      // Spawn enemies
-      const spawnRate = Math.max(500, 1800 - s.level * 100);
-      if (ts - s.lastEnemy > spawnRate) {
-        const cols = Math.min(2 + s.level, 5);
-        const minGap = 70;
+      // Spawn enemies — hard caps to preserve performance at all levels
+      const MAX_ENEMIES = 8;
+      const spawnRate = Math.max(900, 1800 - s.level * 60); // floor at 900ms
+      if (ts - s.lastEnemy > spawnRate && s.enemies.length < MAX_ENEMIES) {
+        const cols = Math.min(2 + Math.floor(s.level / 2), 3); // max 3 per wave
+        const slots = Math.min(cols, MAX_ENEMIES - s.enemies.length);
+        const minGap = Math.floor(s.W / 4); // spread evenly, big gap
         const used = [];
-        for (let i = 0; i < cols; i++) {
+        for (let i = 0; i < slots; i++) {
           let ex, tries = 0;
-          do { ex = rand(50, s.W - 50); tries++; } while (tries < 20 && used.some(u => Math.abs(u - ex) < minGap));
+          do { ex = rand(55, s.W - 55); tries++; } while (tries < 30 && used.some(u => Math.abs(u - ex) < minGap));
           used.push(ex);
-          const hp = 1 + Math.floor(s.level / 3);
+          const hp = 1 + Math.floor(s.level / 4);
+          const maxSpd = Math.min(1.5 + s.level * 0.12, 3.2); // speed capped at 3.2
           s.enemies.push({
             id: enemyId++, x: ex, y: -35,
-            vy: rand(1.0, 1.8 + s.level * 0.25),
+            vy: rand(1.0, maxSpd),
             hp, maxHp: hp, type: Math.floor(rand(0, 4)),
           });
         }
