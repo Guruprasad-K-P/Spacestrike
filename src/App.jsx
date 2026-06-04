@@ -1,475 +1,416 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ── responsive dimensions ──────────────────────────────────────────────────
-function getDims() {
-  return { W: window.innerWidth, H: window.innerHeight };
+// ── Audio Engine (Web Audio API - no files needed) ──────────────────────────
+class SoundEngine {
+  constructor() {
+    this.ctx = null;
+    this.enabled = true;
+  }
+  init() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === "suspended") this.ctx.resume();
+  }
+  _play(type, freq, dur, vol = 0.3, shape = "square") {
+    if (!this.enabled || !this.ctx) return;
+    try {
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      o.connect(g); g.connect(this.ctx.destination);
+      o.type = shape; o.frequency.setValueAtTime(freq, this.ctx.currentTime);
+      if (type === "shoot") {
+        o.frequency.exponentialRampToValueAtTime(freq * 0.3, this.ctx.currentTime + dur);
+      } else if (type === "explode") {
+        o.frequency.exponentialRampToValueAtTime(30, this.ctx.currentTime + dur);
+      } else if (type === "levelup") {
+        o.frequency.setValueAtTime(440, this.ctx.currentTime);
+        o.frequency.setValueAtTime(550, this.ctx.currentTime + 0.1);
+        o.frequency.setValueAtTime(660, this.ctx.currentTime + 0.2);
+        o.frequency.setValueAtTime(880, this.ctx.currentTime + 0.3);
+      }
+      g.gain.setValueAtTime(vol, this.ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + dur);
+      o.start(); o.stop(this.ctx.currentTime + dur);
+    } catch (e) {}
+  }
+  shoot()   { this._play("shoot",   800,  0.12, 0.15, "sawtooth"); }
+  explode() { this._play("explode", 200,  0.35, 0.4,  "sawtooth"); }
+  hit()     { this._play("hit",     300,  0.1,  0.2,  "square");   }
+  levelup() { this._play("levelup", 440,  0.5,  0.35, "sine");     }
+  die()     { this._play("explode", 120,  0.6,  0.5,  "sawtooth"); }
+  gameover(){ 
+    if (!this.enabled || !this.ctx) return;
+    [200, 160, 120, 80].forEach((f, i) => {
+      setTimeout(() => this._play("explode", f, 0.4, 0.4, "sawtooth"), i * 180);
+    });
+  }
 }
+const sfx = new SoundEngine();
 
-const COLORS = ["#a78bfa", "#60a5fa", "#34d399", "#f472b6", "#fbbf24", "#f87171", "#38bdf8"];
+// ── Canvas-based Game (single canvas = best mobile perf) ───────────────────
+const SHIP_SPEED = 5;
+const BULLET_SPEED = 12;
+const BULLET_COOLDOWN = 180;
+const COLORS = ["#f87171","#fb923c","#f472b6","#38bdf8","#a78bfa","#34d399","#fbbf24"];
 
 function rand(a, b) { return a + Math.random() * (b - a); }
 
-// ── Sound Engine (Web Audio API) ───────────────────────────────────────────
-function createSoundEngine() {
-  let ctx = null;
-
-  function getCtx() {
-    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (ctx.state === "suspended") ctx.resume();
-    return ctx;
-  }
-
-  function playShoot() {
-    try {
-      const c = getCtx();
-      const osc = c.createOscillator();
-      const gain = c.createGain();
-      osc.connect(gain); gain.connect(c.destination);
-      osc.type = "square";
-      osc.frequency.setValueAtTime(880, c.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(220, c.currentTime + 0.08);
-      gain.gain.setValueAtTime(0.15, c.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.1);
-      osc.start(c.currentTime); osc.stop(c.currentTime + 0.1);
-    } catch (_) {}
-  }
-
-  function playExplode() {
-    try {
-      const c = getCtx();
-      const bufSize = c.sampleRate * 0.3;
-      const buf = c.createBuffer(1, bufSize, c.sampleRate);
-      const data = buf.getChannelData(0);
-      for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
-      const src = c.createBufferSource();
-      src.buffer = buf;
-      const gain = c.createGain();
-      const filter = c.createBiquadFilter();
-      filter.type = "bandpass"; filter.frequency.value = 300;
-      src.connect(filter); filter.connect(gain); gain.connect(c.destination);
-      gain.gain.setValueAtTime(0.4, c.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.3);
-      src.start(c.currentTime); src.stop(c.currentTime + 0.3);
-    } catch (_) {}
-  }
-
-  function playLevelUp() {
-    try {
-      const c = getCtx();
-      [523, 659, 784, 1047].forEach((freq, i) => {
-        const osc = c.createOscillator();
-        const gain = c.createGain();
-        osc.connect(gain); gain.connect(c.destination);
-        osc.type = "sine";
-        const t = c.currentTime + i * 0.1;
-        osc.frequency.setValueAtTime(freq, t);
-        gain.gain.setValueAtTime(0.2, t);
-        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
-        osc.start(t); osc.stop(t + 0.15);
-      });
-    } catch (_) {}
-  }
-
-  function playHit() {
-    try {
-      const c = getCtx();
-      const osc = c.createOscillator();
-      const gain = c.createGain();
-      osc.connect(gain); gain.connect(c.destination);
-      osc.type = "sawtooth";
-      osc.frequency.setValueAtTime(200, c.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(80, c.currentTime + 0.12);
-      gain.gain.setValueAtTime(0.25, c.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.12);
-      osc.start(c.currentTime); osc.stop(c.currentTime + 0.12);
-    } catch (_) {}
-  }
-
-  return { playShoot, playExplode, playLevelUp, playHit };
-}
-
-const sound = createSoundEngine();
-
-// ── tiny components ──────────────────────────────────────────────────────────
-
-function BgStars({ W, H }) {
-  const stars = useRef([...Array(120)].map(() => ({
-    x: rand(0, 100), y: rand(0, 100),
-    s: rand(1, 3), o: rand(0.2, 0.8),
-  }))).current;
-  return (
-    <>
-      {stars.map((s, i) => (
-        <div key={i} style={{
-          position: "absolute", left: `${s.x}%`, top: `${s.y}%`,
-          width: s.s, height: s.s, borderRadius: "50%",
-          background: "white", opacity: s.o, pointerEvents: "none",
-        }} />
-      ))}
-    </>
-  );
-}
-
-function Ship({ x, y }) {
-  return (
-    <div style={{
-      position: "absolute", left: x - 20, top: y - 28,
-      width: 40, height: 56, pointerEvents: "none",
-    }}>
-      <div style={{
-        position: "absolute", left: 12, top: 0,
-        width: 16, height: 40, background: "linear-gradient(180deg,#a78bfa,#60a5fa)",
-        clipPath: "polygon(50% 0%,100% 100%,0% 100%)", borderRadius: 4,
-      }} />
-      <div style={{
-        position: "absolute", left: 0, top: 20,
-        width: 40, height: 18,
-        background: "linear-gradient(90deg,#38bdf8,#a78bfa,#38bdf8)",
-        clipPath: "polygon(0% 100%,30% 0%,70% 0%,100% 100%)",
-      }} />
-      <div style={{
-        position: "absolute", left: 14, top: 38,
-        width: 12, height: 18,
-        background: "linear-gradient(180deg,#fbbf24,#f87171,transparent)",
-        borderRadius: "0 0 50% 50%",
-        animation: "engineFlicker 0.15s ease-in-out infinite alternate",
-      }} />
-    </div>
-  );
-}
-
-function Bullet({ x, y }) {
-  return (
-    <div style={{
-      position: "absolute", left: x - 2, top: y - 8,
-      width: 4, height: 16, borderRadius: 4,
-      background: "linear-gradient(180deg,#fff,#a78bfa)",
-      boxShadow: "0 0 8px #a78bfa, 0 0 20px #a78bfa88",
-      pointerEvents: "none",
-    }} />
-  );
-}
-
-function Enemy({ x, y, hp, maxHp, type }) {
-  const colors = ["#f87171", "#fb923c", "#f472b6", "#38bdf8"];
-  const c = colors[type % colors.length];
-  const pct = hp / maxHp;
-  return (
-    <div style={{ position: "absolute", left: x - 22, top: y - 18, pointerEvents: "none" }}>
-      <div style={{
-        width: 44, height: 36,
-        background: `radial-gradient(circle at 50% 40%, ${c}cc, ${c}44)`,
-        border: `1.5px solid ${c}`,
-        borderRadius: "50% 50% 40% 40%",
-        boxShadow: `0 0 12px ${c}88`,
-        position: "relative",
-      }}>
-        <div style={{ position: "absolute", top: 10, left: 8, width: 8, height: 8, background: "white", borderRadius: "50%" }} />
-        <div style={{ position: "absolute", top: 10, right: 8, width: 8, height: 8, background: "white", borderRadius: "50%" }} />
-        <div style={{ position: "absolute", top: 12, left: 10, width: 4, height: 4, background: "#111", borderRadius: "50%" }} />
-        <div style={{ position: "absolute", top: 12, right: 10, width: 4, height: 4, background: "#111", borderRadius: "50%" }} />
-        {[-12, -4, 4, 12].map((tx, i) => (
-          <div key={i} style={{
-            position: "absolute", bottom: -10, left: 22 + tx - 2,
-            width: 4, height: 12, background: c,
-            borderRadius: "0 0 4px 4px",
-            animation: `tentacle 0.6s ${i * 0.15}s ease-in-out infinite alternate`,
-          }} />
-        ))}
-      </div>
-      <div style={{ marginTop: 3, width: 44, height: 4, background: "#ffffff22", borderRadius: 2 }}>
-        <div style={{ width: `${pct * 100}%`, height: "100%", background: pct > 0.5 ? "#34d399" : pct > 0.25 ? "#fbbf24" : "#f87171", borderRadius: 2, transition: "width 0.1s" }} />
-      </div>
-    </div>
-  );
-}
-
-function Explosion({ x, y }) {
-  return (
-    <div style={{ position: "absolute", left: x - 30, top: y - 30, pointerEvents: "none" }}>
-      {[...Array(10)].map((_, i) => {
-        const angle = (i / 10) * 2 * Math.PI;
-        const dist = rand(15, 40);
-        return (
-          <div key={i} style={{
-            position: "absolute",
-            width: rand(4, 10), height: rand(4, 10),
-            borderRadius: "50%",
-            background: COLORS[i % COLORS.length],
-            left: 30 + Math.cos(angle) * dist,
-            top: 30 + Math.sin(angle) * dist,
-            boxShadow: `0 0 8px ${COLORS[i % COLORS.length]}`,
-            animation: `explode ${rand(0.4, 0.8)}s ease-out forwards`,
-          }} />
-        );
-      })}
-    </div>
-  );
-}
-
-function FloatingText({ x, y, text, color }) {
-  return (
-    <div style={{
-      position: "absolute", left: x, top: y,
-      color, fontWeight: 700, fontSize: 18,
-      textShadow: `0 0 8px ${color}`,
-      animation: "floatUp 0.8s ease-out forwards",
-      pointerEvents: "none", whiteSpace: "nowrap",
-    }}>{text}</div>
-  );
-}
-
-// ── Mobile joystick ─────────────────────────────────────────────────────────
-function MobileControls({ onMove }) {
-  const joystickRef = useRef(null);
-  const activeTouch = useRef(null);
-  const basePos = useRef({ x: 0, y: 0 });
-
-  const handleTouchStart = (e) => {
-    const touch = e.touches[0];
-    activeTouch.current = touch.identifier;
-    basePos.current = { x: touch.clientX, y: touch.clientY };
-  };
-
-  const handleTouchMove = (e) => {
-    for (let i = 0; i < e.touches.length; i++) {
-      if (e.touches[i].identifier === activeTouch.current) {
-        const dx = e.touches[i].clientX - basePos.current.x;
-        onMove(dx);
-        break;
-      }
-    }
-  };
-
-  const handleTouchEnd = () => {
-    activeTouch.current = null;
-    onMove(0);
-  };
-
-  return (
-    <div
-      ref={joystickRef}
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      onTouchEnd={handleTouchEnd}
-      style={{
-        position: "absolute", bottom: 24, left: "50%", transform: "translateX(-50%)",
-        width: 120, height: 50,
-        background: "rgba(167,139,250,0.15)",
-        border: "1px solid rgba(167,139,250,0.3)",
-        borderRadius: 25,
-        display: "flex", alignItems: "center", justifyContent: "center",
-        color: "rgba(167,139,250,0.6)", fontSize: 12, letterSpacing: "0.05em",
-        userSelect: "none", touchAction: "none", zIndex: 30,
-      }}
-    >
-      ← DRAG →
-    </div>
-  );
-}
-
-// ── main game ─────────────────────────────────────────────────────────────────
-
 let bulletId = 0, enemyId = 0, explId = 0, floatId = 0;
 
+// ── React Shell ─────────────────────────────────────────────────────────────
 export default function App() {
-  const [dims, setDims] = useState(getDims);
+  const canvasRef = useRef(null);
   const [phase, setPhase] = useState("menu");
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(3);
   const [level, setLevel] = useState(1);
   const [highScore, setHighScore] = useState(0);
-  const [isMobile, setIsMobile] = useState(false);
+  const [soundOn, setSoundOn] = useState(true);
+  const phaseRef = useRef("menu");
 
-  const { W, H } = dims;
+  // game state refs
+  const gameState = useRef({
+    shipX: 0, shipY: 0,
+    bullets: [], enemies: [], explosions: [], floats: [],
+    keys: {}, lastShot: 0, lastEnemy: 0,
+    score: 0, lives: 3, level: 1,
+    W: 0, H: 0,
+    touchX: null, isShooting: false,
+  });
+  const animRef = useRef(null);
+  const canvasCtxRef = useRef(null);
 
-  // Detect mobile & handle resize
-  useEffect(() => {
-    const checkMobile = () => {
-      setIsMobile(window.innerWidth < 768 || "ontouchstart" in window);
-      setDims(getDims());
-    };
-    checkMobile();
-    window.addEventListener("resize", checkMobile);
-    return () => window.removeEventListener("resize", checkMobile);
+  // ── Drawing helpers ───────────────────────────────────────────────────────
+  const drawShip = useCallback((ctx, x, y) => {
+    const s = gameState.current;
+    const scale = Math.min(s.W, s.H) / 600;
+    const sz = 28 * Math.max(scale, 0.7);
+    // engine flame
+    const flicker = 0.7 + Math.random() * 0.6;
+    const grad = ctx.createLinearGradient(x, y + sz * 0.6, x, y + sz * 1.4 * flicker);
+    grad.addColorStop(0, "#fbbf24"); grad.addColorStop(0.5, "#f87171"); grad.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.beginPath();
+    ctx.moveTo(x - sz * 0.25, y + sz * 0.6);
+    ctx.lineTo(x, y + sz * 1.4 * flicker);
+    ctx.lineTo(x + sz * 0.25, y + sz * 0.6);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+    // wings
+    ctx.beginPath();
+    ctx.moveTo(x - sz, y + sz * 0.5);
+    ctx.lineTo(x - sz * 0.15, y - sz * 0.2);
+    ctx.lineTo(x - sz * 0.15, y + sz * 0.6);
+    ctx.closePath();
+    const wgL = ctx.createLinearGradient(x - sz, y, x, y);
+    wgL.addColorStop(0,"#38bdf8"); wgL.addColorStop(1,"#a78bfa");
+    ctx.fillStyle = wgL; ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x + sz, y + sz * 0.5);
+    ctx.lineTo(x + sz * 0.15, y - sz * 0.2);
+    ctx.lineTo(x + sz * 0.15, y + sz * 0.6);
+    ctx.closePath();
+    const wgR = ctx.createLinearGradient(x, y, x + sz, y);
+    wgR.addColorStop(0,"#a78bfa"); wgR.addColorStop(1,"#38bdf8");
+    ctx.fillStyle = wgR; ctx.fill();
+    // body
+    const bodyGrad = ctx.createLinearGradient(x, y - sz, x, y + sz * 0.6);
+    bodyGrad.addColorStop(0,"#a78bfa"); bodyGrad.addColorStop(1,"#60a5fa");
+    ctx.beginPath();
+    ctx.moveTo(x, y - sz);
+    ctx.lineTo(x + sz * 0.35, y + sz * 0.6);
+    ctx.lineTo(x - sz * 0.35, y + sz * 0.6);
+    ctx.closePath();
+    ctx.fillStyle = bodyGrad; ctx.fill();
+    // cockpit
+    ctx.beginPath();
+    ctx.ellipse(x, y - sz * 0.25, sz * 0.12, sz * 0.2, 0, 0, Math.PI * 2);
+    ctx.fillStyle = "#c7d2fe88"; ctx.fill();
   }, []);
 
-  // game objects stored in refs
-  const shipX = useRef(W / 2);
-  const joystickDx = useRef(0);
-  const bullets = useRef([]);
-  const enemies = useRef([]);
-  const explosions = useRef([]);
-  const floatingTexts = useRef([]);
-  const keys = useRef({});
-  const lastShot = useRef(0);
-  const lastEnemy = useRef(0);
-  const scoreRef = useRef(0);
-  const livesRef = useRef(3);
-  const levelRef = useRef(1);
-  const animRef = useRef(null);
-  const shootSoundCooldown = useRef(0);
+  const drawBullet = useCallback((ctx, x, y) => {
+    const grad = ctx.createLinearGradient(x, y - 14, x, y + 4);
+    grad.addColorStop(0,"#fff"); grad.addColorStop(1,"#a78bfa");
+    ctx.shadowColor = "#a78bfa"; ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.roundRect(x - 2, y - 14, 4, 18, 2);
+    ctx.fillStyle = grad; ctx.fill();
+    ctx.shadowBlur = 0;
+  }, []);
 
-  const [, forceRender] = useState(0);
-  const tick = useRef(0);
+  const drawEnemy = useCallback((ctx, enemy, ts) => {
+    const { x, y, hp, maxHp, type, id } = enemy;
+    const s = gameState.current;
+    const scale = Math.min(s.W, s.H) / 600;
+    const sz = 22 * Math.max(scale, 0.7);
+    const c = COLORS[type % COLORS.length];
+    const wobble = Math.sin(ts * 0.003 + id) * 2;
+    // body
+    ctx.save();
+    ctx.shadowColor = c; ctx.shadowBlur = 12;
+    const bodyGrad = ctx.createRadialGradient(x, y + wobble - sz * 0.2, sz * 0.1, x, y + wobble, sz);
+    bodyGrad.addColorStop(0, c + "dd"); bodyGrad.addColorStop(1, c + "44");
+    ctx.beginPath();
+    ctx.ellipse(x, y + wobble, sz, sz * 0.8, 0, 0, Math.PI * 2);
+    ctx.fillStyle = bodyGrad; ctx.fill();
+    ctx.strokeStyle = c; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.shadowBlur = 0;
+    // eyes
+    ctx.fillStyle = "white";
+    ctx.beginPath(); ctx.arc(x - sz * 0.28, y + wobble - sz * 0.1, sz * 0.18, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + sz * 0.28, y + wobble - sz * 0.1, sz * 0.18, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#111";
+    ctx.beginPath(); ctx.arc(x - sz * 0.24, y + wobble - sz * 0.08, sz * 0.09, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + sz * 0.24, y + wobble - sz * 0.08, sz * 0.09, 0, Math.PI * 2); ctx.fill();
+    // tentacles
+    const tentaclePhase = ts * 0.005;
+    for (let i = -1.5; i <= 1.5; i++) {
+      const tx = x + i * sz * 0.4;
+      const swing = Math.sin(tentaclePhase + i) * 5;
+      ctx.beginPath();
+      ctx.moveTo(tx, y + wobble + sz * 0.7);
+      ctx.quadraticCurveTo(tx + swing, y + wobble + sz * 1.1, tx + swing * 0.5, y + wobble + sz * 1.4);
+      ctx.strokeStyle = c; ctx.lineWidth = 3; ctx.lineCap = "round"; ctx.stroke();
+    }
+    // HP bar
+    const barW = sz * 2.2, barH = 4;
+    const barX = x - barW / 2, barY = y + wobble + sz * 1.5;
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.roundRect(barX, barY, barW, barH, 2); ctx.fill();
+    const pct = hp / maxHp;
+    ctx.fillStyle = pct > 0.5 ? "#34d399" : pct > 0.25 ? "#fbbf24" : "#f87171";
+    ctx.roundRect(barX, barY, barW * pct, barH, 2); ctx.fill();
+    ctx.restore();
+  }, []);
 
-  const startGame = () => {
-    // Unlock audio context on user gesture
-    sound.playShoot && (() => { try { sound.playShoot(); } catch (_) {} })();
-    shipX.current = W / 2;
-    bullets.current = [];
-    enemies.current = [];
-    explosions.current = [];
-    floatingTexts.current = [];
-    scoreRef.current = 0;
-    livesRef.current = 3;
-    levelRef.current = 1;
-    joystickDx.current = 0;
+  const drawExplosion = useCallback((ctx, expl, ts) => {
+    const progress = (ts - expl.ts) / 600;
+    if (progress >= 1) return;
+    const alpha = 1 - progress;
+    ctx.save();
+    for (let i = 0; i < 8; i++) {
+      const angle = (i / 8) * Math.PI * 2 + expl.seed;
+      const dist = expl.radii[i] * progress * 50;
+      const px = expl.x + Math.cos(angle) * dist;
+      const py = expl.y + Math.sin(angle) * dist;
+      const r = expl.sizes[i] * (1 - progress * 0.5);
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.arc(px, py, r, 0, Math.PI * 2);
+      ctx.fillStyle = COLORS[i % COLORS.length];
+      ctx.shadowColor = COLORS[i % COLORS.length];
+      ctx.shadowBlur = 8;
+      ctx.fill();
+    }
+    ctx.restore();
+  }, []);
+
+  const drawFloat = useCallback((ctx, f, ts) => {
+    const progress = (ts - f.ts) / 800;
+    if (progress >= 1) return;
+    ctx.save();
+    ctx.globalAlpha = 1 - progress;
+    ctx.fillStyle = f.color;
+    ctx.font = `bold ${f.big ? 22 : 16}px 'Segoe UI', sans-serif`;
+    ctx.shadowColor = f.color; ctx.shadowBlur = 8;
+    ctx.fillText(f.text, f.x, f.y - progress * 55);
+    ctx.restore();
+  }, []);
+
+  // ── Main game loop ─────────────────────────────────────────────────────────
+  const startGame = useCallback(() => {
+    sfx.init();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const W = canvas.width; const H = canvas.height;
+    const s = gameState.current;
+    s.W = W; s.H = H;
+    s.shipX = W / 2; s.shipY = H - 90;
+    s.bullets = []; s.enemies = []; s.explosions = []; s.floats = [];
+    s.keys = {}; s.lastShot = 0; s.lastEnemy = 0; s.touchX = null;
+    s.score = 0; s.lives = 3; s.level = 1;
+    bulletId = 0; enemyId = 0; explId = 0; floatId = 0;
     setScore(0); setLives(3); setLevel(1);
+    phaseRef.current = "playing";
     setPhase("playing");
-  };
+  }, []);
 
   const endGame = useCallback(() => {
+    sfx.gameover();
     cancelAnimationFrame(animRef.current);
-    setHighScore(h => Math.max(h, scoreRef.current));
+    setHighScore(h => Math.max(h, gameState.current.score));
+    phaseRef.current = "gameover";
     setPhase("gameover");
   }, []);
 
-  // Joystick handler
-  const handleJoystickMove = useCallback((dx) => {
-    joystickDx.current = dx;
-  }, []);
-
+  // ── Canvas game loop ───────────────────────────────────────────────────────
   useEffect(() => {
     if (phase !== "playing") return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    canvasCtxRef.current = ctx;
+    const s = gameState.current;
 
-    const currentW = window.innerWidth;
-    const currentH = window.innerHeight;
+    // Stars (static, generated once)
+    const stars = Array.from({ length: 80 }, () => ({
+      x: rand(0, s.W), y: rand(0, s.H), r: rand(0.5, 2), o: rand(0.2, 0.8),
+    }));
 
-    const onKey = (e) => { keys.current[e.code] = e.type === "keydown"; };
+    // Input
+    const onKey = e => { s.keys[e.code] = e.type === "keydown"; };
     window.addEventListener("keydown", onKey);
     window.addEventListener("keyup", onKey);
 
-    // Mouse move for desktop
-    const onMouseMove = (e) => {
-      shipX.current = Math.max(30, Math.min(currentW - 30, e.clientX));
-    };
+    const onMouseMove = e => { s.touchX = Math.max(30, Math.min(s.W - 30, e.clientX)); };
     window.addEventListener("mousemove", onMouseMove);
 
-    // Touch move on the game area (non-joystick) for direct tap control
-    const onTouchMove = (e) => {
-      const t = e.touches[0];
-      shipX.current = Math.max(30, Math.min(currentW - 30, t.clientX));
+    const onTouchMove = e => {
+      e.preventDefault();
+      s.touchX = Math.max(30, Math.min(s.W - 30, e.touches[0].clientX));
     };
-    window.addEventListener("touchmove", onTouchMove, { passive: true });
+    canvas.addEventListener("touchmove", onTouchMove, { passive: false });
 
-    const SHIP_Y = currentH - 90;
-    const SHIP_SPEED = 5;
-    const BULLET_SPEED = 11;
-    const BULLET_COOLDOWN = 220;
+    const onTouchStart = e => {
+      s.touchX = Math.max(30, Math.min(s.W - 30, e.touches[0].clientX));
+      s.lastShot = 0; // force immediate shot
+    };
+    canvas.addEventListener("touchstart", onTouchStart, { passive: true });
+
+    const SHIP_Y = s.H - 90;
+    s.shipY = SHIP_Y;
 
     const loop = (ts) => {
-      const W_ = currentW;
-      const H_ = currentH;
+      if (phaseRef.current !== "playing") return;
 
-      // Move ship — keyboard or joystick
-      if (keys.current["ArrowLeft"] || keys.current["KeyA"])
-        shipX.current = Math.max(30, shipX.current - SHIP_SPEED);
-      if (keys.current["ArrowRight"] || keys.current["KeyD"])
-        shipX.current = Math.min(W_ - 30, shipX.current + SHIP_SPEED);
-
-      // Joystick drag
-      if (Math.abs(joystickDx.current) > 5) {
-        const speed = Math.min(Math.abs(joystickDx.current) * 0.08, 9);
-        shipX.current = Math.max(30, Math.min(W_ - 30,
-          shipX.current + (joystickDx.current > 0 ? speed : -speed)
-        ));
+      // ── Update ──────────────────────────────────────────────────────────
+      // Move ship
+      if (s.keys["ArrowLeft"] || s.keys["KeyA"]) s.shipX = Math.max(30, s.shipX - SHIP_SPEED);
+      if (s.keys["ArrowRight"] || s.keys["KeyD"]) s.shipX = Math.min(s.W - 30, s.shipX + SHIP_SPEED);
+      if (s.touchX !== null) {
+        const diff = s.touchX - s.shipX;
+        s.shipX += diff * 0.18; // smooth follow
       }
 
-      // Auto-shoot
-      if (ts - lastShot.current > BULLET_COOLDOWN) {
-        bullets.current.push({ id: bulletId++, x: shipX.current, y: SHIP_Y - 10 });
-        lastShot.current = ts;
-        if (ts - shootSoundCooldown.current > 200) {
-          sound.playShoot();
-          shootSoundCooldown.current = ts;
-        }
+      // Shoot
+      if (ts - s.lastShot > BULLET_COOLDOWN) {
+        s.bullets.push({ id: bulletId++, x: s.shipX, y: SHIP_Y - 18 });
+        sfx.shoot();
+        s.lastShot = ts;
       }
 
       // Move bullets
-      bullets.current = bullets.current
-        .map(b => ({ ...b, y: b.y - BULLET_SPEED }))
-        .filter(b => b.y > -20);
+      for (let i = s.bullets.length - 1; i >= 0; i--) {
+        s.bullets[i].y -= BULLET_SPEED;
+        if (s.bullets[i].y < -20) s.bullets.splice(i, 1);
+      }
 
       // Spawn enemies
-      const spawnRate = Math.max(600, 1800 - levelRef.current * 120);
-      if (ts - lastEnemy.current > spawnRate) {
-        const cols = Math.min(3 + levelRef.current, 7);
+      const spawnRate = Math.max(500, 1800 - s.level * 100);
+      if (ts - s.lastEnemy > spawnRate) {
+        const cols = Math.min(2 + s.level, 5);
+        const minGap = 70;
+        const used = [];
         for (let i = 0; i < cols; i++) {
-          enemies.current.push({
-            id: enemyId++,
-            x: rand(40, W_ - 40),
-            y: -30,
-            vy: rand(1.2, 2 + levelRef.current * 0.3),
-            hp: 1 + Math.floor(levelRef.current / 3),
-            maxHp: 1 + Math.floor(levelRef.current / 3),
-            type: Math.floor(rand(0, 4)),
+          let ex, tries = 0;
+          do { ex = rand(50, s.W - 50); tries++; } while (tries < 20 && used.some(u => Math.abs(u - ex) < minGap));
+          used.push(ex);
+          const hp = 1 + Math.floor(s.level / 3);
+          s.enemies.push({
+            id: enemyId++, x: ex, y: -35,
+            vy: rand(1.0, 1.8 + s.level * 0.25),
+            hp, maxHp: hp, type: Math.floor(rand(0, 4)),
           });
         }
-        lastEnemy.current = ts;
+        s.lastEnemy = ts;
       }
 
       // Move enemies
-      enemies.current = enemies.current.map(e => ({ ...e, y: e.y + e.vy }));
+      for (const e of s.enemies) e.y += e.vy;
 
-      // Enemy reaches bottom → lose life
-      const reached = enemies.current.filter(e => e.y > H_ + 20);
-      if (reached.length > 0) {
-        enemies.current = enemies.current.filter(e => e.y <= H_ + 20);
-        livesRef.current -= reached.length;
-        setLives(livesRef.current);
-        sound.playHit();
-        if (livesRef.current <= 0) { endGame(); return; }
+      // Enemies reaching bottom
+      let lostLives = 0;
+      for (let i = s.enemies.length - 1; i >= 0; i--) {
+        if (s.enemies[i].y > s.H + 30) {
+          s.enemies.splice(i, 1);
+          lostLives++;
+        }
+      }
+      if (lostLives > 0) {
+        s.lives -= lostLives;
+        sfx.die();
+        setLives(s.lives);
+        if (s.lives <= 0) { endGame(); return; }
       }
 
-      // Bullet ↔ enemy collision
+      // Bullet-enemy collision
       const hitBullets = new Set();
-      enemies.current = enemies.current.filter(enemy => {
-        const hit = bullets.current.find(
-          b => !hitBullets.has(b.id) && Math.abs(b.x - enemy.x) < 26 && Math.abs(b.y - enemy.y) < 26
-        );
-        if (hit) {
-          hitBullets.add(hit.id);
-          enemy.hp -= 1;
-          if (enemy.hp <= 0) {
-            explosions.current.push({ id: explId++, x: enemy.x, y: enemy.y, ts });
-            sound.playExplode();
-            const pts = (1 + Math.floor(levelRef.current / 2)) * 10;
-            scoreRef.current += pts;
-            setScore(scoreRef.current);
-            floatingTexts.current.push({ id: floatId++, x: enemy.x - 10, y: enemy.y, text: `+${pts}`, color: "#34d399", ts });
-            return false;
+      for (let ei = s.enemies.length - 1; ei >= 0; ei--) {
+        const enemy = s.enemies[ei];
+        for (let bi = s.bullets.length - 1; bi >= 0; bi--) {
+          const b = s.bullets[bi];
+          if (!hitBullets.has(b.id) && Math.abs(b.x - enemy.x) < 28 && Math.abs(b.y - enemy.y) < 28) {
+            hitBullets.add(b.id);
+            enemy.hp -= 1;
+            if (enemy.hp <= 0) {
+              s.explosions.push({
+                id: explId++, x: enemy.x, y: enemy.y, ts,
+                seed: Math.random() * Math.PI * 2,
+                radii: Array.from({length:8}, () => rand(0.5, 1)),
+                sizes: Array.from({length:8}, () => rand(4, 10)),
+              });
+              sfx.explode();
+              const pts = (1 + Math.floor(s.level / 2)) * 10;
+              s.score += pts;
+              setScore(s.score);
+              s.floats.push({ id: floatId++, x: enemy.x - 12, y: enemy.y, text: `+${pts}`, color: "#34d399", ts, big: false });
+              s.enemies.splice(ei, 1);
+            } else {
+              sfx.hit();
+            }
+            break;
           }
         }
-        return true;
-      });
-      bullets.current = bullets.current.filter(b => !hitBullets.has(b.id));
+      }
+      // Remove hit bullets
+      for (let i = s.bullets.length - 1; i >= 0; i--) {
+        if (hitBullets.has(s.bullets[i].id)) s.bullets.splice(i, 1);
+      }
 
       // Level up
-      const newLevel = 1 + Math.floor(scoreRef.current / 300);
-      if (newLevel !== levelRef.current) {
-        levelRef.current = newLevel;
+      const newLevel = 1 + Math.floor(s.score / 300);
+      if (newLevel !== s.level) {
+        s.level = newLevel;
         setLevel(newLevel);
-        sound.playLevelUp();
-        floatingTexts.current.push({ id: floatId++, x: W_ / 2 - 50, y: H_ / 2, text: `Level ${newLevel}!`, color: "#fbbf24", ts });
+        sfx.levelup();
+        s.floats.push({ id: floatId++, x: s.W / 2 - 55, y: s.H / 2 - 30, text: `⬆ LEVEL ${newLevel}!`, color: "#fbbf24", ts, big: true });
       }
 
       // Expire
-      explosions.current = explosions.current.filter(e => ts - e.ts < 700);
-      floatingTexts.current = floatingTexts.current.filter(f => ts - f.ts < 800);
+      const now = ts;
+      s.explosions = s.explosions.filter(e => now - e.ts < 600);
+      s.floats = s.floats.filter(f => now - f.ts < 800);
 
-      tick.current++;
-      forceRender(tick.current);
+      // ── Draw ─────────────────────────────────────────────────────────────
+      // Background
+      const bg = ctx.createRadialGradient(s.W * 0.5, s.H * 0.6, 0, s.W * 0.5, s.H * 0.6, s.H);
+      bg.addColorStop(0, "#0f0c2e"); bg.addColorStop(1, "#050510");
+      ctx.fillStyle = bg; ctx.fillRect(0, 0, s.W, s.H);
+
+      // Stars
+      for (const star of stars) {
+        ctx.globalAlpha = star.o;
+        ctx.fillStyle = "white";
+        ctx.fillRect(star.x, star.y, star.r, star.r);
+      }
+      ctx.globalAlpha = 1;
+
+      // Game objects
+      for (const expl of s.explosions) drawExplosion(ctx, expl, ts);
+      for (const b of s.bullets) drawBullet(ctx, b.x, b.y);
+      for (const e of s.enemies) drawEnemy(ctx, e, ts);
+      drawShip(ctx, s.shipX, SHIP_Y);
+      for (const f of s.floats) drawFloat(ctx, f, ts);
+
       animRef.current = requestAnimationFrame(loop);
     };
 
@@ -480,191 +421,160 @@ export default function App() {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("keyup", onKey);
       window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("touchmove", onTouchMove);
+      canvas.removeEventListener("touchmove", onTouchMove);
+      canvas.removeEventListener("touchstart", onTouchStart);
     };
-  }, [phase, endGame]);
+  }, [phase, endGame, drawShip, drawBullet, drawEnemy, drawExplosion, drawFloat]);
 
-  const SHIP_Y = H - 90;
+  // ── Canvas resize ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const resize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      gameState.current.W = canvas.width;
+      gameState.current.H = canvas.height;
+      gameState.current.shipY = canvas.height - 90;
+    };
+    resize();
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, []);
+
+  const toggleSound = () => {
+    sfx.enabled = !sfx.enabled;
+    setSoundOn(sfx.enabled);
+    if (sfx.enabled) sfx.init();
+  };
+
+  // ── UI Overlays ────────────────────────────────────────────────────────────
+  const isMobile = window.innerWidth < 600;
 
   return (
-    <div style={{
-      width: "100vw", height: "100vh",
-      background: "radial-gradient(ellipse at 50% 60%, #0f0c2e 0%, #050510 100%)",
-      overflow: "hidden", position: "relative",
-      fontFamily: "'Segoe UI', sans-serif",
-      userSelect: "none",
-      touchAction: "none",
-    }}>
+    <div style={{ width:"100vw", height:"100vh", overflow:"hidden", position:"relative",
+      background:"#050510", fontFamily:"'Segoe UI',sans-serif", userSelect:"none", touchAction:"none" }}>
       <style>{`
-        @keyframes engineFlicker { 0%{opacity:1;transform:scaleY(1)} 100%{opacity:0.6;transform:scaleY(0.7)} }
-        @keyframes tentacle { 0%{transform:rotate(-15deg)} 100%{transform:rotate(15deg)} }
-        @keyframes explode { 0%{opacity:1;transform:scale(1)} 100%{opacity:0;transform:scale(0)} }
-        @keyframes floatUp { 0%{opacity:1;transform:translateY(0)} 100%{opacity:0;transform:translateY(-60px)} }
-        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-        @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-12px)} }
-        @keyframes shimmer {
-          0%{background-position:-200% center}
-          100%{background-position:200% center}
-        }
-        @keyframes glow { 0%,100%{box-shadow:0 0 20px #a78bfa88,0 0 60px #a78bfa22} 50%{box-shadow:0 0 40px #a78bfacc,0 0 80px #a78bfa55} }
-        
-        .game-title {
-          font-size: clamp(28px, 7vw, 56px);
-          font-weight: 900;
-          letter-spacing: 0.05em;
-          text-align: center;
-          line-height: 1.1;
-          margin-bottom: 8px;
-          white-space: nowrap;
-          background: linear-gradient(90deg,#a78bfa,#60a5fa,#34d399,#f472b6,#a78bfa);
-          background-size: 200% auto;
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          background-clip: text;
-          animation: shimmer 2s linear infinite;
-        }
-
-        @media (max-width: 400px) {
-          .game-title { font-size: 24px; letter-spacing: 0.02em; }
-        }
+        @keyframes shimmer{0%{background-position:-200% center}100%{background-position:200% center}}
+        @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
+        @keyframes glow{0%,100%{box-shadow:0 0 20px #a78bfa88}50%{box-shadow:0 0 40px #a78bfacc}}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+        @keyframes fadeIn{from{opacity:0;transform:scale(0.9)}to{opacity:1;transform:scale(1)}}
+        * { -webkit-tap-highlight-color: transparent; }
       `}</style>
 
-      <BgStars W={W} H={H} />
+      {/* Canvas — always mounted for resize handling */}
+      <canvas ref={canvasRef} style={{ position:"absolute", inset:0, display: phase === "playing" ? "block" : "none" }} />
+
+      {/* Sound toggle */}
+      <button onClick={toggleSound} style={{
+        position:"absolute", top:14, right:16, zIndex:100,
+        background:"rgba(255,255,255,0.08)", border:"1px solid rgba(255,255,255,0.15)",
+        borderRadius:8, color:"white", fontSize:18, padding:"6px 10px", cursor:"pointer",
+      }}>{soundOn ? "🔊" : "🔇"}</button>
 
       {/* ── MENU ── */}
       {phase === "menu" && (
-        <div style={{
-          position: "absolute", inset: 0,
-          display: "flex", alignItems: "center", justifyContent: "center",
-          flexDirection: "column", gap: 0,
-          padding: "0 20px",
-        }}>
-          <h1 className="game-title">🚀 Space Shooter</h1>
-
-          <p style={{
-            color: "rgba(200,200,255,0.6)", fontSize: "clamp(12px,3vw,15px)",
-            marginBottom: 24, textAlign: "center", letterSpacing: "0.04em",
-          }}>
-            {isMobile ? "Drag to move · Auto-fires · Survive!" : "Move mouse · Auto-fires · Survive!"}
-          </p>
-
+        <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center",
+          justifyContent:"center", flexDirection:"column",
+          background:"radial-gradient(ellipse at 50% 60%, #0f0c2e 0%, #050510 100%)" }}>
+          {/* Stars bg */}
+          {Array.from({length:60}).map((_,i) => (
+            <div key={i} style={{
+              position:"absolute",
+              left:`${rand(0,100)}%`, top:`${rand(0,100)}%`,
+              width: rand(1,3), height: rand(1,3),
+              background:"white", borderRadius:"50%", opacity: rand(0.2, 0.8),
+              pointerEvents:"none",
+            }}/>
+          ))}
+          <div style={{ animation:"float 3s ease-in-out infinite", marginBottom:6, fontSize:isMobile?52:68 }}>🚀</div>
           <div style={{
-            color: "rgba(200,200,255,0.5)", fontSize: "clamp(11px,2.5vw,13px)",
-            marginBottom: 24, textAlign: "center", lineHeight: 1.8,
-          }}>
-            {isMobile ? (
-              <>Drag the bar at the bottom to move<br />Destroy aliens before they reach you<br />Level up every 300 points</>
-            ) : (
-              <>← → Arrow keys or mouse to move<br />Destroy aliens before they reach you<br />Level up every 300 points</>
-            )}
-          </div>
-
+            fontSize: isMobile ? 32 : 48, fontWeight:900, letterSpacing:"0.06em",
+            background:"linear-gradient(90deg,#a78bfa,#60a5fa,#34d399,#f472b6,#a78bfa)",
+            backgroundSize:"200% auto", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
+            animation:"shimmer 2s linear infinite", marginBottom:10, textAlign:"center",
+          }}>Space Shooter</div>
+          <p style={{ color:"rgba(200,200,255,0.55)", fontSize: isMobile ? 13 : 15,
+            marginBottom:28, textAlign:"center", lineHeight:1.8, padding:"0 24px" }}>
+            Move mouse or touch · Auto-fires · Survive the alien invasion!<br/>
+            🎵 Sound effects included — turn up the volume!
+          </p>
           {highScore > 0 && (
-            <div style={{ color: "#fbbf24", fontSize: 14, marginBottom: 20, textShadow: "0 0 8px #fbbf24" }}>
-              🏆 Best: {highScore}
+            <div style={{ color:"#fbbf24", fontSize:15, marginBottom:20,
+              textShadow:"0 0 8px #fbbf24", animation:"pulse 2s ease infinite" }}>
+              🏆 Best Score: {highScore}
             </div>
           )}
-
-          <button
-            onClick={startGame}
-            style={{
-              padding: "14px 48px", fontSize: "clamp(16px,4vw,20px)",
-              fontWeight: 700, border: "none", borderRadius: 50, cursor: "pointer",
-              background: "linear-gradient(135deg,#a78bfa,#60a5fa)",
-              color: "white",
-              animation: "float 3s ease-in-out infinite, glow 2s ease-in-out infinite",
-              letterSpacing: "0.05em",
-              touchAction: "manipulation",
-            }}
-          >▶ Start Game</button>
+          <button onClick={() => { sfx.init(); startGame(); }} style={{
+            padding: isMobile ? "14px 44px" : "16px 56px",
+            fontSize: isMobile ? 18 : 20, fontWeight:700, border:"none",
+            borderRadius:50, cursor:"pointer",
+            background:"linear-gradient(135deg,#a78bfa,#60a5fa)",
+            color:"white", animation:"float 3s ease-in-out infinite, glow 2s ease-in-out infinite",
+            letterSpacing:"0.05em", touchAction:"manipulation",
+          }}>▶ Start Game</button>
+          <p style={{ color:"rgba(255,255,255,0.2)", fontSize:11, marginTop:20, textAlign:"center" }}>
+            Keyboard: ←→ or A/D to move
+          </p>
         </div>
       )}
 
-      {/* ── PLAYING ── */}
+      {/* ── HUD (playing) ── */}
       {phase === "playing" && (
-        <>
-          {/* HUD */}
-          <div style={{
-            position: "absolute", top: 0, left: 0, right: 0,
-            padding: "12px 16px",
-            display: "flex", justifyContent: "space-between", alignItems: "center",
-            background: "rgba(0,0,0,0.3)", backdropFilter: "blur(8px)", zIndex: 20,
-          }}>
-            <div style={{ color: "#a78bfa", fontWeight: 700, fontSize: "clamp(13px,3.5vw,16px)", textShadow: "0 0 8px #a78bfa" }}>
-              ⭐ {score}
-            </div>
-            <div style={{ color: "#fbbf24", fontWeight: 600, fontSize: "clamp(12px,3vw,14px)", letterSpacing: "0.08em" }}>
-              LEVEL {level}
-            </div>
-            <div style={{ fontSize: "clamp(14px,3.5vw,18px)" }}>
-              {[...Array(3)].map((_, i) => (
-                <span key={i} style={{ opacity: i < lives ? 1 : 0.15, marginLeft: 4 }}>❤️</span>
-              ))}
-            </div>
+        <div style={{ position:"absolute", top:0, left:0, right:0, zIndex:10,
+          padding:"10px 16px", display:"flex", justifyContent:"space-between", alignItems:"center",
+          background:"rgba(0,0,0,0.35)", backdropFilter:"blur(6px)" }}>
+          <div style={{ color:"#a78bfa", fontWeight:700, fontSize: isMobile ? 15 : 17,
+            textShadow:"0 0 8px #a78bfa" }}>⭐ {score}</div>
+          <div style={{ color:"#fbbf24", fontWeight:700, fontSize: isMobile ? 13 : 15,
+            letterSpacing:"0.08em" }}>LVL {level}</div>
+          <div style={{ fontSize: isMobile ? 16 : 20 }}>
+            {[...Array(3)].map((_,i) => (
+              <span key={i} style={{ opacity: i < lives ? 1 : 0.15, marginLeft: 3 }}>❤️</span>
+            ))}
           </div>
-
-          {/* Game objects */}
-          {bullets.current.map(b => <Bullet key={b.id} {...b} />)}
-          {enemies.current.map(e => <Enemy key={e.id} {...e} />)}
-          {explosions.current.map(e => <Explosion key={e.id} {...e} />)}
-          {floatingTexts.current.map(f => <FloatingText key={f.id} {...f} />)}
-          <Ship x={shipX.current} y={SHIP_Y} />
-
-          {/* Mobile joystick */}
-          {isMobile && <MobileControls onMove={handleJoystickMove} />}
-
-          {/* Desktop hint */}
-          {!isMobile && (
-            <div style={{
-              position: "absolute", bottom: 16, left: 0, right: 0, textAlign: "center",
-              color: "rgba(255,255,255,0.2)", fontSize: 12,
-            }}>
-              ← → Move · Auto-fires
-            </div>
-          )}
-        </>
+        </div>
       )}
 
       {/* ── GAME OVER ── */}
       {phase === "gameover" && (
-        <div style={{
-          position: "absolute", inset: 0,
-          display: "flex", alignItems: "center", justifyContent: "center",
-          flexDirection: "column", gap: 8,
-          padding: "0 20px",
-        }}>
-          <div style={{
-            fontSize: "clamp(36px,10vw,48px)", fontWeight: 900, color: "#f87171",
-            textShadow: "0 0 30px #f87171", marginBottom: 8, textAlign: "center",
-          }}>Game Over</div>
-          <div style={{ fontSize: "clamp(18px,5vw,22px)", color: "#a78bfa", fontWeight: 700, textShadow: "0 0 12px #a78bfa", marginBottom: 4 }}>
-            Score: {score}
-          </div>
-          {score >= highScore && score > 0 && (
-            <div style={{ color: "#fbbf24", fontSize: 16, textShadow: "0 0 8px #fbbf24", marginBottom: 8 }}>
-              🏆 New High Score!
-            </div>
+        <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center",
+          justifyContent:"center", flexDirection:"column", gap:8,
+          background:"radial-gradient(ellipse at 50% 50%, #1a0a0a 0%, #050510 100%)",
+          animation:"fadeIn 0.4s ease-out" }}>
+          {Array.from({length:40}).map((_,i) => (
+            <div key={i} style={{
+              position:"absolute", left:`${rand(0,100)}%`, top:`${rand(0,100)}%`,
+              width:rand(1,2.5), height:rand(1,2.5), background:"white",
+              borderRadius:"50%", opacity:rand(0.15,0.6), pointerEvents:"none",
+            }}/>
+          ))}
+          <div style={{ fontSize: isMobile ? 40 : 52, fontWeight:900, color:"#f87171",
+            textShadow:"0 0 30px #f87171", marginBottom:4 }}>Game Over</div>
+          <div style={{ fontSize: isMobile ? 20 : 26, color:"#a78bfa", fontWeight:700,
+            textShadow:"0 0 12px #a78bfa" }}>Score: {score}</div>
+          {score > 0 && score >= highScore && (
+            <div style={{ color:"#fbbf24", fontSize:16, textShadow:"0 0 8px #fbbf24",
+              animation:"pulse 1s ease infinite" }}>🏆 New High Score!</div>
           )}
           {score < highScore && (
-            <div style={{ color: "rgba(200,200,255,0.5)", fontSize: 14, marginBottom: 8 }}>
-              Best: {highScore}
-            </div>
+            <div style={{ color:"rgba(200,200,255,0.45)", fontSize:13 }}>Best: {highScore}</div>
           )}
-          <div style={{ color: "rgba(200,200,255,0.5)", fontSize: 14, marginBottom: 28 }}>
+          <div style={{ color:"rgba(200,200,255,0.45)", fontSize:13, marginBottom:24 }}>
             Reached Level {level}
           </div>
           <button onClick={startGame} style={{
-            padding: "14px 48px", fontSize: "clamp(15px,4vw,18px)", fontWeight: 700,
-            border: "none", borderRadius: 50, cursor: "pointer", marginBottom: 12,
-            background: "linear-gradient(135deg,#a78bfa,#60a5fa)",
-            color: "white", animation: "float 3s ease-in-out infinite",
-            touchAction: "manipulation",
+            padding: isMobile ? "13px 40px" : "14px 48px",
+            fontSize: isMobile ? 17 : 19, fontWeight:700, border:"none",
+            borderRadius:50, cursor:"pointer", marginBottom:10,
+            background:"linear-gradient(135deg,#a78bfa,#60a5fa)", color:"white",
+            animation:"float 3s ease-in-out infinite", touchAction:"manipulation",
           }}>▶ Play Again</button>
-          <button onClick={() => setPhase("menu")} style={{
-            padding: "10px 32px", fontSize: 14, fontWeight: 600,
-            border: "1px solid rgba(167,139,250,0.4)", borderRadius: 50, cursor: "pointer",
-            background: "transparent", color: "rgba(200,200,255,0.7)",
-            touchAction: "manipulation",
+          <button onClick={() => { phaseRef.current = "menu"; setPhase("menu"); }} style={{
+            padding:"9px 28px", fontSize:13, fontWeight:600, borderRadius:50, cursor:"pointer",
+            border:"1px solid rgba(167,139,250,0.4)", background:"transparent",
+            color:"rgba(200,200,255,0.65)", touchAction:"manipulation",
           }}>Main Menu</button>
         </div>
       )}
